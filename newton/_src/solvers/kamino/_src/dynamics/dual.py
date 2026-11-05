@@ -66,6 +66,7 @@ from ..core.model import ModelKamino
 from ..core.size import SizeKamino
 from ..core.types import vec6f
 from ..dynamics.delassus import BlockSparseMatrixFreeDelassusOperator, DelassusOperator
+from ..dynamics.delassus_compact import CompactCholeskySolver, CompactDelassusOperator
 from ..geometry.contacts import ContactsKamino
 from ..kinematics.jacobians import DenseSystemJacobians, SparseSystemJacobians
 from ..kinematics.limits import LimitsKamino
@@ -255,12 +256,8 @@ class DualProblemData:
     Shape of `(num_worlds,)`.
     """
 
-    D: wp.array[wp.float32] | None = None
-    """
-    The flat array of Delassus matrix blocks (constraint-space apparent inertia).
-    Includes physical compliance when enabled, before numerical regularization.
-    Shape of `(sum_of_max_total_delassus_size,)`.
-    """
+    D: wp.array[wp.float32] | wp.array2d[wp.float32] | None = None
+    """Delassus blocks, including physical compliance, stored packed or in compact rows."""
 
     P: wp.array[wp.float32] | None = None
     """
@@ -1109,7 +1106,7 @@ def _build_dual_preconditioner_all_constraints(
 
 
 @wp.kernel
-def _build_dual_preconditioner_all_constraints_sparse(
+def _build_dual_preconditioner_from_diagonal(
     # Inputs:
     problem_config: wp.array[DualProblemConfigStruct],
     problem_dim: wp.array[wp.int32],
@@ -1117,6 +1114,7 @@ def _build_dual_preconditioner_all_constraints_sparse(
     problem_njc: wp.array[wp.int32],
     problem_nbc: wp.array[wp.int32],
     problem_nl: wp.array[wp.int32],
+    problem_diagonal: wp.array[wp.float32],
     # Outputs:
     problem_P: wp.array[wp.float32],
 ):
@@ -1145,7 +1143,7 @@ def _build_dual_preconditioner_all_constraints_sparse(
     _build_dual_preconditioner_entry(
         tid,
         njlc,
-        problem_P,
+        problem_diagonal,
         vio,
         1,
         vio,
@@ -1543,7 +1541,8 @@ class DualProblem:
                 )
             )
         else:
-            self._delassus = DelassusOperator(
+            operator_type = CompactDelassusOperator if solver is CompactCholeskySolver else DelassusOperator
+            self._delassus = operator_type(
                 model=model,
                 data=data,
                 limits=limits,
@@ -1676,8 +1675,7 @@ class DualProblem:
         if reset_to_zero:
             self.zero()
 
-        # Build the dense Delassus operator if applicable
-        # NOTE: We build this first since it will update the arrays of active constraints
+        # Build the constraint matrix before the other terms.
         if not self._sparse:
             self._delassus.build(
                 model=model,
@@ -1685,6 +1683,7 @@ class DualProblem:
                 jacobians=jacobians,
                 reset_to_zero=reset_to_zero,
             )
+            self._data.D = self._delassus.D
 
         # Optionally also build the non-linear generalized force vector
         if self._compute_h:
@@ -2041,10 +2040,15 @@ class DualProblem:
         """
         Builds the diagonal preconditioner 'P' according to the current Delassus operator.
         """
-        if self._sparse:
-            self._delassus.diagonal(self._data.P)
+        if self._sparse or getattr(self._delassus, "compact", False):
+            if self._sparse:
+                self._delassus.diagonal(self._data.P)
+                diagonal = self._data.P
+            else:
+                diagonal = self._delassus.original_diagonal
+                self._delassus.diagonal(diagonal)
             wp.launch(
-                _build_dual_preconditioner_all_constraints_sparse,
+                _build_dual_preconditioner_from_diagonal,
                 dim=(self._size.num_worlds, self._size.max_of_max_total_cts),
                 inputs=[
                     # Inputs:
@@ -2054,6 +2058,7 @@ class DualProblem:
                     self._data.njc,
                     self._data.nbc,
                     self._data.nl,
+                    diagonal,
                     # Outputs:
                     self._data.P,
                 ],
@@ -2087,6 +2092,8 @@ class DualProblem:
         if self._sparse:
             # Preconditioner has already been connected to appropriate array
             pass
+        elif getattr(self._delassus, "compact", False):
+            self._delassus.apply_preconditioner(self._data.P)
         else:
             wp.launch(
                 _apply_dual_preconditioner_to_matrix,

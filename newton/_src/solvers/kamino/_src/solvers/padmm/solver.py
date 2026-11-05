@@ -542,7 +542,9 @@ class PADMMSolver:
         Args:
             problem: The dual forward dynamics problem to be solved.
         """
-        if problem.sparse:
+        if getattr(problem.delassus, "compact", False):
+            problem.delassus.update_proximal(self._data.status, self._data.state.sigma)
+        elif problem.sparse:
             self._update_sparse_regularization(problem)
             # Let a raw-Jacobian linear solver (e.g. the fused single-kernel CR) rebuild its
             # per-step index structures here, before the (possibly graph-captured) iteration loop,
@@ -1260,26 +1262,29 @@ class PADMMSolver:
         Args:
             problem: The dual forward dynamics problem to be solved.
         """
-        # First reset the internal buffer arrays to zero
-        # to ensure we do not accumulate values across iterations
+        # Clear values from the previous iteration.
         self.data.info.v_plus.zero_()
         self.data.info.v_aug.zero_()
         self._data.info.s.zero_()
 
         # Collect convergence information from the current state
-        if problem.sparse:
+        is_compact = getattr(problem.delassus, "compact", False)
+        if problem.sparse or is_compact:
             # Initialize post-event constraint-space velocity from solution: v_plus = v_f + D @ lambda
             wp.copy(self._data.info.v_plus, problem.data.v_f)
-            delassus_reg_prev = problem.delassus._eta
-            problem.delassus.set_regularization(None)
-            problem.delassus.gemv(
-                x=self._data.state.y,
-                y=self._data.info.v_plus,
-                world_mask=wp.ones((problem.data.num_worlds,), dtype=wp.bool, device=self.device),
-                alpha=1.0,
-                beta=1.0,
-            )
-            problem.delassus.set_regularization(delassus_reg_prev)
+            if is_compact:
+                problem.delassus.multiply(self._data.state.y, self._data.info.v_plus, beta=1.0)
+            else:
+                delassus_reg_prev = problem.delassus._eta
+                problem.delassus.set_regularization(None)
+                problem.delassus.gemv(
+                    x=self._data.state.y,
+                    y=self._data.info.v_plus,
+                    world_mask=wp.ones((problem.data.num_worlds,), dtype=wp.bool, device=self.device),
+                    alpha=1.0,
+                    beta=1.0,
+                )
+                problem.delassus.set_regularization(delassus_reg_prev)
             wp.launch(
                 kernel=self._collect_solver_info_kernel_sparse,
                 dim=self._size.num_worlds,

@@ -1725,20 +1725,23 @@ class SolutionMetrics:
         self._assert_has_data()
 
         # Compute the dual problem NCP/VI performance metrics
-        if problem.sparse:
-            # Compute post-event constraint-space velocity from solution: v_plus = v_f + D @ lambda
-            # Store it in buffer for further processing in dual problem metrics computation
-            delassus_reg_prev = problem.delassus._eta
-            delassus_pre_prev = problem.delassus._preconditioner
-            problem.delassus.set_regularization(None)
-            problem.delassus.set_preconditioner(None)
-            problem.delassus.matvec(
-                x=lambdas,
-                y=self._buffer_v,
-                world_mask=wp.ones((problem.data.num_worlds,), dtype=wp.bool, device=self.device),
-            )
-            problem.delassus.set_regularization(delassus_reg_prev)
-            problem.delassus.set_preconditioner(delassus_pre_prev)
+        is_compact = getattr(problem.delassus, "compact", False)
+        if problem.sparse or is_compact:
+            # Compute D @ lambda for the metrics kernel.
+            if is_compact:
+                problem.delassus.multiply(lambdas, self._buffer_v, physical=True)
+            else:
+                delassus_reg_prev = problem.delassus._eta
+                delassus_pre_prev = problem.delassus._preconditioner
+                problem.delassus.set_regularization(None)
+                problem.delassus.set_preconditioner(None)
+                problem.delassus.matvec(
+                    x=lambdas,
+                    y=self._buffer_v,
+                    world_mask=wp.ones((problem.data.num_worlds,), dtype=wp.bool, device=self.device),
+                )
+                problem.delassus.set_regularization(delassus_reg_prev)
+                problem.delassus.set_preconditioner(delassus_pre_prev)
             wp.launch(
                 kernel=_compute_dual_problem_metrics_sparse,
                 dim=problem.size.num_worlds,
