@@ -54,6 +54,7 @@ Typical usage example:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from functools import cache
 from typing import Any
 
 import warp as wp
@@ -921,80 +922,89 @@ def _build_free_velocity_bias_contacts(
     problem_mu[cio_k] = mu_k
 
 
-@wp.kernel
-def _build_free_velocity(
-    # Inputs:
-    model_info_bodies_offset: wp.array[wp.int32],
-    data_bodies_u_i: wp.array[wp.spatial_vectorf],
-    jacobians_J_cts_offsets: wp.array[wp.int32],
-    jacobians_J_cts_data: wp.array[wp.float32],
-    problem_dim: wp.array[wp.int32],
-    problem_vio: wp.array[wp.int32],
-    problem_u_f: wp.array[wp.spatial_vectorf],
-    problem_v_b: wp.array[wp.float32],
-    problem_v_i: wp.array[wp.float32],
-    # Outputs:
-    problem_v_f: wp.array[wp.float32],
-):
-    # Retrieve the thread index
-    wid, tid = wp.tid()
+@cache
+def make_build_free_velocity_kernel(array_ndim: int = 1):
+    JacobianArray = wp.array[wp.float32] if array_ndim == 1 else wp.array2d[wp.float32]
 
-    # Retrieve the problem dimensions and matrix block index offset
-    ncts = problem_dim[wid]
+    @wp.kernel(module="unique", module_options={"enable_backward": False, "default_grid_stride": False})
+    def _build_free_velocity(
+        # Inputs:
+        model_info_bodies_offset: wp.array[wp.int32],
+        data_bodies_u_i: wp.array[wp.spatial_vectorf],
+        jacobians_J_cts_offsets: wp.array[wp.int32],
+        jacobians_J_cts_storage: JacobianArray,
+        problem_dim: wp.array[wp.int32],
+        problem_vio: wp.array[wp.int32],
+        problem_u_f: wp.array[wp.spatial_vectorf],
+        problem_v_b: wp.array[wp.float32],
+        problem_v_i: wp.array[wp.float32],
+        # Outputs:
+        problem_v_f: wp.array[wp.float32],
+    ):
+        # Retrieve the thread index
+        wid, tid = wp.tid()
+        jacobians_J_cts_data = (
+            jacobians_J_cts_storage[wid] if wp.static(JacobianArray.ndim == 2) else jacobians_J_cts_storage
+        )
 
-    # Skip if row index exceed the problem size
-    if tid >= ncts:
-        return
+        # Retrieve the problem dimensions and matrix block index offset
+        ncts = problem_dim[wid]
 
-    # Retrieve the world-specific data
-    bio = model_info_bodies_offset[wid]
-    nb = model_info_bodies_offset[wid + 1] - bio
-    cjmio = jacobians_J_cts_offsets[wid]
-    vio = problem_vio[wid]
+        # Skip if row index exceed the problem size
+        if tid >= ncts:
+            return
 
-    # Compute the number of Jacobian rows, i.e. the number of body DoFs
-    nbd = 6 * nb
+        # Retrieve the world-specific data
+        bio = model_info_bodies_offset[wid]
+        nb = model_info_bodies_offset[wid + 1] - bio
+        cjmio = jacobians_J_cts_offsets[wid]
+        vio = problem_vio[wid]
 
-    # Compute the thread-specific index offset
-    cts_offset = vio + tid
+        # Compute the number of Jacobian rows, i.e. the number of body DoFs
+        nbd = 6 * nb
 
-    # Append the column offset to the Jacobian index
-    cjmio += nbd * tid
+        # Compute the thread-specific index offset
+        cts_offset = vio + tid
 
-    # Extract the cached impact bias scaling (i.e. restitution coefficient)
-    # NOTE: This is a quick hack to avoid multiple kernels. The
-    # proper way would be to perform this op only for contacts
-    epsilon_j = problem_v_i[cts_offset]
+        # Append the column offset to the Jacobian index
+        cjmio += nbd * tid
 
-    # Retrieve the cached velocity bias term for the constraint
-    v_b_j = problem_v_b[cts_offset]
+        # Extract the cached impact bias scaling (i.e. restitution coefficient)
+        # NOTE: This is a quick hack to avoid multiple kernels. The
+        # proper way would be to perform this op only for contacts
+        epsilon_j = problem_v_i[cts_offset]
 
-    # Buffers
-    J_i = vec6f(0.0)
-    v_f_j = wp.float32(0.0)
+        # Retrieve the cached velocity bias term for the constraint
+        v_b_j = problem_v_b[cts_offset]
 
-    # Iterate over each body to accumulate velocity contributions
-    for i in range(nb):
-        # Compute the Jacobian block index
-        m_ji = cjmio + 6 * i
+        # Buffers
+        J_i = vec6f(0.0)
+        v_f_j = wp.float32(0.0)
 
-        # Extract the twist and unconstrained velocity of the body
-        u_i = data_bodies_u_i[bio + i]
-        u_f_i = problem_u_f[bio + i]
+        # Iterate over each body to accumulate velocity contributions
+        for i in range(nb):
+            # Compute the Jacobian block index
+            m_ji = cjmio + 6 * i
 
-        # Extract the Jacobian block J_ji
-        # TODO: use slicing operation when available
-        for d in range(6):
-            J_i[d] = jacobians_J_cts_data[m_ji + d]
+            # Extract the twist and unconstrained velocity of the body
+            u_i = data_bodies_u_i[bio + i]
+            u_f_i = problem_u_f[bio + i]
 
-        # Accumulate J_i @ u_i
-        v_f_j += wp.dot(J_i, u_f_i)
+            # Extract the Jacobian block J_ji
+            # TODO: use slicing operation when available
+            for d in range(6):
+                J_i[d] = jacobians_J_cts_data[m_ji + d]
 
-        # Accumulate the impact bias term
-        v_f_j += epsilon_j * wp.dot(J_i, u_i)
+            # Accumulate J_i @ u_i
+            v_f_j += wp.dot(J_i, u_f_i)
 
-    # Store sum of velocity bias terms
-    problem_v_f[cts_offset] = v_f_j + v_b_j
+            # Accumulate the impact bias term
+            v_f_j += epsilon_j * wp.dot(J_i, u_i)
+
+        # Store sum of velocity bias terms
+        problem_v_f[cts_offset] = v_f_j + v_b_j
+
+    return _build_free_velocity
 
 
 @wp.kernel
@@ -1729,7 +1739,7 @@ class DualProblem:
             )
         else:
             wp.launch(
-                _build_free_velocity,
+                make_build_free_velocity_kernel(jacobians.data.J_cts_data.ndim),
                 dim=(self._size.num_worlds, self._size.max_of_max_total_cts),
                 inputs=[
                     # Inputs:
@@ -2017,7 +2027,7 @@ class DualProblem:
         Builds the free-velocity vector `v_f`.
         """
         wp.launch(
-            _build_free_velocity,
+            make_build_free_velocity_kernel(jacobians.data.J_cts_data.ndim),
             dim=(self._size.num_worlds, self._size.max_of_max_total_cts),
             inputs=[
                 # Inputs:

@@ -152,84 +152,91 @@ def upper_triangular_indices_from_index(index: int, mat_size: int):
 ###
 
 
-@wp.kernel
-def _build_delassus_elementwise_dense(
-    # Inputs:
-    model_info_bodies_offset: wp.array[wp.int32],
-    model_bodies_inv_m_i: wp.array[wp.float32],
-    data_bodies_inv_I_i: wp.array[wp.mat33f],
-    jacobians_cts_offset: wp.array[wp.int32],
-    jacobians_cts_data: wp.array[wp.float32],
-    delassus_dim: wp.array[wp.int32],
-    delassus_mio: wp.array[wp.int32],
-    # Outputs:
-    delassus_D: wp.array[wp.float32],
-):
-    # Retrieve the thread index as the world index and upper-triangle element index
-    wid, tid = wp.tid()
+@functools.cache
+def make_build_delassus_elementwise_dense_kernel(array_ndim: int = 1):
+    JacobianArray = wp.array[wp.float32] if array_ndim == 1 else wp.array2d[wp.float32]
 
-    # Retrieve the world dimensions
-    bio = model_info_bodies_offset[wid]
-    nb = model_info_bodies_offset[wid + 1] - bio
+    @wp.kernel(module="unique", module_options={"enable_backward": False, "default_grid_stride": False})
+    def _build_delassus_elementwise_dense(
+        # Inputs:
+        model_info_bodies_offset: wp.array[wp.int32],
+        model_bodies_inv_m_i: wp.array[wp.float32],
+        data_bodies_inv_I_i: wp.array[wp.mat33f],
+        jacobians_cts_offset: wp.array[wp.int32],
+        jacobians_cts_storage: JacobianArray,
+        delassus_dim: wp.array[wp.int32],
+        delassus_mio: wp.array[wp.int32],
+        # Outputs:
+        delassus_D: wp.array[wp.float32],
+    ):
+        # Retrieve the thread index as the world index and upper-triangle element index
+        wid, tid = wp.tid()
+        jacobians_cts_data = jacobians_cts_storage[wid] if wp.static(JacobianArray.ndim == 2) else jacobians_cts_storage
 
-    # Retrieve the problem dimensions
-    ncts = delassus_dim[wid]
+        # Retrieve the world dimensions
+        bio = model_info_bodies_offset[wid]
+        nb = model_info_bodies_offset[wid + 1] - bio
 
-    # Skip if world has no constraints
-    if ncts == 0:
-        return
+        # Retrieve the problem dimensions
+        ncts = delassus_dim[wid]
 
-    # The Delassus matrix is symmetric, so we only compute the upper triangle (i <= j).
-    # Recover matrix indices from tid.
-    i, j = upper_triangular_indices_from_index(tid, ncts)
-    if i < 0 or i >= ncts or j < i or j >= ncts:
-        return
+        # Skip if world has no constraints
+        if ncts == 0:
+            return
 
-    # Retrieve the world's matrix offsets
-    dmio = delassus_mio[wid]
-    cjmio = jacobians_cts_offset[wid]
+        # The Delassus matrix is symmetric, so we only compute the upper triangle (i <= j).
+        # Recover matrix indices from tid.
+        i, j = upper_triangular_indices_from_index(tid, ncts)
+        if i < 0 or i >= ncts or j < i or j >= ncts:
+            return
 
-    # Compute the number of body DoFs of the world
-    nbd = 6 * nb
+        # Retrieve the world's matrix offsets
+        dmio = delassus_mio[wid]
+        cjmio = jacobians_cts_offset[wid]
 
-    # Buffers
-    Jv_i = wp.vec3f(0.0)
-    Jv_j = wp.vec3f(0.0)
-    Jw_i = wp.vec3f(0.0)
-    Jw_j = wp.vec3f(0.0)
-    D_ij = wp.float32(0.0)
+        # Compute the number of body DoFs of the world
+        nbd = 6 * nb
 
-    # Loop over rigid body blocks
-    # NOTE: k is the body index w.r.t the world
-    for k in range(nb):
-        # Body index (bid) of body k w.r.t the model
-        bid_k = bio + k
-        # DoF index offset (dio) of body k in the flattened Jacobian matrix
-        # NOTE: Equivalent to the column index in the matrix-form of the Jacobian matrix
-        dio_k = 6 * k
-        # Jacobian index offsets
-        jio_ik = cjmio + nbd * i + dio_k
-        jio_jk = cjmio + nbd * j + dio_k
+        # Buffers
+        Jv_i = wp.vec3f(0.0)
+        Jv_j = wp.vec3f(0.0)
+        Jw_i = wp.vec3f(0.0)
+        Jw_j = wp.vec3f(0.0)
+        D_ij = wp.float32(0.0)
 
-        # Load the Jacobian blocks of body k
-        for d in range(3):
-            # Load the i-th row block
-            Jv_i[d] = jacobians_cts_data[jio_ik + d]
-            Jw_i[d] = jacobians_cts_data[jio_ik + d + 3]
-            # Load the j-th row block
-            Jv_j[d] = jacobians_cts_data[jio_jk + d]
-            Jw_j[d] = jacobians_cts_data[jio_jk + d + 3]
+        # Loop over rigid body blocks
+        # NOTE: k is the body index w.r.t the world
+        for k in range(nb):
+            # Body index (bid) of body k w.r.t the model
+            bid_k = bio + k
+            # DoF index offset (dio) of body k in the flattened Jacobian matrix
+            # NOTE: Equivalent to the column index in the matrix-form of the Jacobian matrix
+            dio_k = 6 * k
+            # Jacobian index offsets
+            jio_ik = cjmio + nbd * i + dio_k
+            jio_jk = cjmio + nbd * j + dio_k
 
-        # Linear term: inv_m_k * dot(Jv_i, Jv_j)
-        # Angular term: dot(Jw_i, inv_I_k @ Jw_j)
-        inv_m_k = model_bodies_inv_m_i[bid_k]
-        inv_I_k = data_bodies_inv_I_i[bid_k]
-        D_ij += inv_m_k * wp.dot(Jv_i, Jv_j) + wp.dot(Jw_i, inv_I_k @ Jw_j)
+            # Load the Jacobian blocks of body k
+            for d in range(3):
+                # Load the i-th row block
+                Jv_i[d] = jacobians_cts_data[jio_ik + d]
+                Jw_i[d] = jacobians_cts_data[jio_ik + d + 3]
+                # Load the j-th row block
+                Jv_j[d] = jacobians_cts_data[jio_jk + d]
+                Jw_j[d] = jacobians_cts_data[jio_jk + d + 3]
 
-    # Write upper triangle and mirror to lower
-    delassus_D[dmio + ncts * i + j] = D_ij
-    if i != j:
-        delassus_D[dmio + ncts * j + i] = D_ij
+            # Linear term: inv_m_k * dot(Jv_i, Jv_j)
+            # Angular term: dot(Jw_i, inv_I_k @ Jw_j)
+            inv_m_k = model_bodies_inv_m_i[bid_k]
+            inv_I_k = data_bodies_inv_I_i[bid_k]
+            D_ij += inv_m_k * wp.dot(Jv_i, Jv_j) + wp.dot(Jw_i, inv_I_k @ Jw_j)
+
+        # Write upper triangle and mirror to lower
+        delassus_D[dmio + ncts * i + j] = D_ij
+        if i != j:
+            delassus_D[dmio + ncts * j + i] = D_ij
+
+    return _build_delassus_elementwise_dense
 
 
 @wp.kernel
@@ -1104,7 +1111,7 @@ class DelassusOperator:
             warp_size = 32
             upper_tri_size = ((upper_tri_size + warp_size - 1) // warp_size) * warp_size
             wp.launch(
-                kernel=_build_delassus_elementwise_dense,
+                kernel=make_build_delassus_elementwise_dense_kernel(jacobians.data.J_cts_data.ndim),
                 dim=(self._size.num_worlds, upper_tri_size),
                 inputs=[
                     # Inputs:

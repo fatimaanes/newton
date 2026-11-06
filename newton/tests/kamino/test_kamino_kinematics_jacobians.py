@@ -14,6 +14,7 @@ import warp as wp
 from newton import Axis, JointTargetMode, ModelBuilder
 from newton._src.solvers.kamino._src.core.model import ModelKamino
 from newton._src.solvers.kamino._src.geometry.contacts import ContactsKamino
+from newton._src.solvers.kamino._src.kinematics import jacobians as jacobian_module
 from newton._src.solvers.kamino._src.kinematics.constraints import make_unilateral_constraints_info
 from newton._src.solvers.kamino._src.kinematics.jacobians import (
     ColMajorSparseConstraintJacobians,
@@ -463,6 +464,7 @@ class TestKinematicsDenseSystemJacobians(unittest.TestCase):
             logger.debug("[world='%d']: J_dofs:\n%s", w, J_dofs[w])
 
     def test_09_build_heterogeneous_dense_system_jacobians(self):
+        """Match packed and per-world Jacobians for heterogeneous worlds."""
         # Construct the test problem
         model, data, _state, limits, contacts = make_test_problem_heterogeneous(
             device=self.default_device,
@@ -486,6 +488,27 @@ class TestKinematicsDenseSystemJacobians(unittest.TestCase):
         for w in range(model.size.num_worlds):
             logger.debug("[world='%d']: J_cts:\n%s", w, J_cts[w])
             logger.debug("[world='%d']: J_dofs:\n%s", w, J_dofs[w])
+
+        J_cts = [matrix.copy() for matrix in J_cts]
+        J_dofs = [matrix.copy() for matrix in J_dofs]
+        for kind, expected in (("cts", J_cts), ("dofs", J_dofs)):
+            rows = wp.zeros(
+                (len(expected), max(matrix.size for matrix in expected)), dtype=wp.float32, device=self.default_device
+            )
+            setattr(jacobians.data, f"J_{kind}_data", rows)
+            getattr(jacobians.data, f"J_{kind}_offsets").zero_()
+            jacobians.build(model=model, data=data, limits=limits.data, contacts=contacts.data)
+            for field, reference in (("cts", J_cts), ("dofs", J_dofs)):
+                actual = getattr(jacobians.data, f"J_{field}_data").numpy()
+                offsets = getattr(jacobians.data, f"J_{field}_offsets").numpy()
+                for world, matrix in enumerate(reference):
+                    row = actual[world] if actual.ndim == 2 else actual[offsets[world] :]
+                    np.testing.assert_array_equal(row[: matrix.size], matrix.ravel())
+
+    def test_10_allocate_large_dense_jacobian_layout(self):
+        """Keep packed offsets small and use rows above the flat index limit."""
+        self.assertEqual(jacobian_module._dense_jacobian_layout([4, 9, 4]), ((17,), [0, 4, 13]))
+        self.assertEqual(jacobian_module._dense_jacobian_layout([138336] * 16384), ((16384, 138336), [0] * 16384))
 
 
 class TestSparseBoundedRowTopology(unittest.TestCase):

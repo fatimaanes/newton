@@ -76,6 +76,7 @@ A typical example for using this module is:
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import cache
 from typing import Any
 
 import warp as wp
@@ -776,69 +777,78 @@ def _compute_eom_residual(
     _atomic_update_metric_max(metric_r_eom, metric_r_eom_argmax, wid, r_eom_i, argmax_key)
 
 
-@wp.kernel
-def _compute_joint_kinematics_residual_dense(
-    # Inputs:
-    model_info_bodies_offset: wp.array[wp.int32],
-    model_info_total_cts_offset: wp.array[wp.int32],
-    model_info_joint_kinematic_cts_group_offset: wp.array[wp.int32],
-    model_joint_wid: wp.array[wp.int32],
-    model_joint_num_kinematic_cts: wp.array[wp.int32],
-    model_joint_kinematic_cts_offset_total_cts: wp.array[wp.int32],
-    model_joint_bid_B: wp.array[wp.int32],
-    model_joint_bid_F: wp.array[wp.int32],
-    data_bodies_u_i: wp.array[wp.spatial_vectorf],
-    jacobian_cts_offset: wp.array[wp.int32],
-    jacobian_cts_data: wp.array[wp.float32],
-    # Outputs:
-    metric_r_kinematics: wp.array[wp.float32],
-    metric_r_kinematics_argmax: wp.array[wp.int64],
-):
-    # Retrieve the joint index from the thread index
-    jid = wp.tid()
+@cache
+def make_compute_joint_kinematics_residual_dense_kernel(array_ndim: int = 1):
+    JacobianArray = wp.array[wp.float32] if array_ndim == 1 else wp.array2d[wp.float32]
 
-    # Retrieve the world index of the joint
-    wid = model_joint_wid[jid]
+    @wp.kernel(module="unique", module_options={"enable_backward": False, "default_grid_stride": False})
+    def _compute_joint_kinematics_residual_dense(
+        # Inputs:
+        model_info_bodies_offset: wp.array[wp.int32],
+        model_info_total_cts_offset: wp.array[wp.int32],
+        model_info_joint_kinematic_cts_group_offset: wp.array[wp.int32],
+        model_joint_wid: wp.array[wp.int32],
+        model_joint_num_kinematic_cts: wp.array[wp.int32],
+        model_joint_kinematic_cts_offset_total_cts: wp.array[wp.int32],
+        model_joint_bid_B: wp.array[wp.int32],
+        model_joint_bid_F: wp.array[wp.int32],
+        data_bodies_u_i: wp.array[wp.spatial_vectorf],
+        jacobian_cts_offset: wp.array[wp.int32],
+        jacobian_cts_storage: JacobianArray,
+        # Outputs:
+        metric_r_kinematics: wp.array[wp.float32],
+        metric_r_kinematics_argmax: wp.array[wp.int64],
+    ):
+        # Retrieve the joint index from the thread index
+        jid = wp.tid()
 
-    # Retrieve the body indices of the joint
-    # NOTE: these indices are w.r.t the model
-    bid_F_j = model_joint_bid_F[jid]
-    bid_B_j = model_joint_bid_B[jid]
+        # Retrieve the world index of the joint
+        wid = model_joint_wid[jid]
+        jacobian_cts_data = jacobian_cts_storage[wid] if wp.static(JacobianArray.ndim == 2) else jacobian_cts_storage
 
-    # Retrieve the size and index offset of the joint constraint
-    num_cts_j = model_joint_num_kinematic_cts[jid]
-    if num_cts_j == 0:
-        return
-    cts_offset_j = model_joint_kinematic_cts_offset_total_cts[jid] - model_info_total_cts_offset[wid]
+        # Retrieve the body indices of the joint
+        # NOTE: these indices are w.r.t the model
+        bid_F_j = model_joint_bid_F[jid]
+        bid_B_j = model_joint_bid_B[jid]
 
-    # Retrieve the world-specific info
-    bio = model_info_bodies_offset[wid]
-    nbd = 6 * (model_info_bodies_offset[wid + 1] - bio)
-    kgo = model_info_joint_kinematic_cts_group_offset[wid]
-    mio = jacobian_cts_offset[wid]
+        # Retrieve the size and index offset of the joint constraint
+        num_cts_j = model_joint_num_kinematic_cts[jid]
+        if num_cts_j == 0:
+            return
+        cts_offset_j = model_joint_kinematic_cts_offset_total_cts[jid] - model_info_total_cts_offset[wid]
 
-    # Compute the per-joint constraint Jacobian matrix-vector product
-    j_v_j = wp.spatial_vectorf(0.0)
-    u_i_F = data_bodies_u_i[bid_F_j]
-    dio_F = 6 * (bid_F_j - bio)
-    for j in range(num_cts_j):
-        mio_j = mio + nbd * (cts_offset_j + j) + dio_F
-        for i in range(6):
-            j_v_j[j] += jacobian_cts_data[mio_j + i] * u_i_F[i]
-    if bid_B_j >= 0:
-        u_i_B = data_bodies_u_i[bid_B_j]
-        dio_B = 6 * (bid_B_j - bio)
+        # Retrieve the world-specific info
+        bio = model_info_bodies_offset[wid]
+        nbd = 6 * (model_info_bodies_offset[wid + 1] - bio)
+        kgo = model_info_joint_kinematic_cts_group_offset[wid]
+        mio = jacobian_cts_offset[wid]
+
+        # Compute the per-joint constraint Jacobian matrix-vector product
+        j_v_j = wp.spatial_vectorf(0.0)
+        u_i_F = data_bodies_u_i[bid_F_j]
+        dio_F = 6 * (bid_F_j - bio)
         for j in range(num_cts_j):
-            mio_j = mio + nbd * (cts_offset_j + j) + dio_B
+            mio_j = mio + nbd * (cts_offset_j + j) + dio_F
             for i in range(6):
-                j_v_j[j] += jacobian_cts_data[mio_j + i] * u_i_B[i]
+                j_v_j[j] += jacobian_cts_data[mio_j + i] * u_i_F[i]
+        if bid_B_j >= 0:
+            u_i_B = data_bodies_u_i[bid_B_j]
+            dio_B = 6 * (bid_B_j - bio)
+            for j in range(num_cts_j):
+                mio_j = mio + nbd * (cts_offset_j + j) + dio_B
+                for i in range(6):
+                    j_v_j[j] += jacobian_cts_data[mio_j + i] * u_i_B[i]
 
-    # Compute the per-joint kinematics residual and local argmax.
-    r_kinematics_j, kin_argmax_local = _spatial_vector_abs_infnorm(j_v_j, num_cts_j)
+        # Compute the per-joint kinematics residual and local argmax.
+        r_kinematics_j, kin_argmax_local = _spatial_vector_abs_infnorm(j_v_j, num_cts_j)
 
-    # Update the per-world maximum residual and argmax index
-    argmax_key = wp.int64(build_pair_key2(wp.uint32(jid), wp.uint32(cts_offset_j - kgo) + wp.uint32(kin_argmax_local)))
-    _atomic_update_metric_max(metric_r_kinematics, metric_r_kinematics_argmax, wid, r_kinematics_j, argmax_key)
+        # Update the per-world maximum residual and argmax index
+        argmax_key = wp.int64(
+            build_pair_key2(wp.uint32(jid), wp.uint32(cts_offset_j - kgo) + wp.uint32(kin_argmax_local))
+        )
+        _atomic_update_metric_max(metric_r_kinematics, metric_r_kinematics_argmax, wid, r_kinematics_j, argmax_key)
+
+    return _compute_joint_kinematics_residual_dense
 
 
 @wp.kernel
@@ -1656,7 +1666,7 @@ class SolutionMetrics:
         if model.size.sum_of_num_joints > 0:
             if isinstance(jacobians, DenseSystemJacobians):
                 wp.launch(
-                    kernel=_compute_joint_kinematics_residual_dense,
+                    kernel=make_compute_joint_kinematics_residual_dense_kernel(jacobians.data.J_cts_data.ndim),
                     dim=model.size.sum_of_num_joints,
                     inputs=[
                         # Inputs:
